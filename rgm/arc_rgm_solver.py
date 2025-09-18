@@ -319,6 +319,8 @@ from arc_tda_features import (
     wasserstein_matching,
 )
 
+from arc_actions import action_count, best_action_by_iou, apply_action_mask
+
 
 # ---------- small utils ----------
 def grid_from_list(lst: List[List[int]]) -> np.ndarray:
@@ -382,14 +384,68 @@ def _derive_token_transition_from_agent(agent) -> Dict[int, int]:
 
 
 # ---------- Motion & colors (from TDA matches) ----------
-def _learn_motion_and_colors(
-    train_pairs: List[Tuple[np.ndarray, np.ndarray]],
-    background: int,
-) -> Tuple[
-    Dict[int, Tuple[int, int]], Tuple[int, int], Dict[int, int], Tuple[int, int]
-]:
-    deltas_by_color: Dict[int, List[Tuple[int, int]]] = {}
-    all_deltas: List[Tuple[int, int]] = []
+# def _learn_motion_and_colors(
+#     train_pairs: List[Tuple[np.ndarray, np.ndarray]],
+#     background: int,
+# ) -> Tuple[
+#     Dict[int, Tuple[int, int]], Tuple[int, int], Dict[int, int], Tuple[int, int]
+# ]:
+#     deltas_by_color: Dict[int, List[Tuple[int, int]]] = {}
+#     all_deltas: List[Tuple[int, int]] = []
+#     color_votes: Dict[int, Dict[int, int]] = {}
+#     out_shape = None
+
+#     for xi, yi in train_pairs:
+#         out_shape = yi.shape
+#         objs_x = grid_to_objects_with_tda(xi, background=background)
+#         objs_y = grid_to_objects_with_tda(yi, background=background)
+#         if len(objs_x) == 0 or len(objs_y) == 0:
+#             continue
+#         matches, _ = wasserstein_matching(objs_x, objs_y, return_matrix=False)
+#         match_map = {i: j for (i, j) in matches}
+#         for i, ox in enumerate(objs_x):
+#             j = match_map.get(i)
+#             if j is None:
+#                 continue
+#             oy = objs_y[j]
+#             cin, cout = int(ox.color), int(oy.color)
+#             cy_in, cx_in = ox.centroid_rc
+#             cy_out, cx_out = oy.centroid_rc
+#             dy = int(np.round(cy_out - cy_in))
+#             dx = int(np.round(cx_out - cx_in))
+#             deltas_by_color.setdefault(cin, []).append((dy, dx))
+#             all_deltas.append((dy, dx))
+#             color_votes.setdefault(cin, {})
+#             color_votes[cin][cout] = color_votes[cin].get(cout, 0) + 1
+
+#     deltas_per_color: Dict[int, Tuple[int, int]] = {}
+#     for cin, lst in deltas_by_color.items():
+#         dys = np.array([d[0] for d in lst], dtype=int)
+#         dxs = np.array([d[1] for d in lst], dtype=int)
+#         deltas_per_color[cin] = (int(np.median(dys)), int(np.median(dxs)))
+#     global_delta = (
+#         int(np.median([d[0] for d in all_deltas])) if all_deltas else 0,
+#         int(np.median([d[1] for d in all_deltas])) if all_deltas else 0,
+#     )
+#     color_map: Dict[int, int] = {
+#         cin: max(d.items(), key=lambda kv: kv[1])[0] for cin, d in color_votes.items()
+#     }
+#     if out_shape is None:
+#         out_shape = train_pairs[-1][1].shape
+#     return deltas_per_color, global_delta, color_map, out_shape
+
+
+def _learn_actions_and_colors(train_pairs, background: int):
+    """
+    Learn:
+      - action priors per color: P(a | color_in)
+      - global action prior: P(a)
+      - color map (majority vote): color_in -> color_out
+      - canonical out_shape
+    """
+    A = action_count()
+    action_counts_global = np.zeros(A, dtype=np.int64)
+    action_counts_by_color: Dict[int, np.ndarray] = {}
     color_votes: Dict[int, Dict[int, int]] = {}
     out_shape = None
 
@@ -401,36 +457,41 @@ def _learn_motion_and_colors(
             continue
         matches, _ = wasserstein_matching(objs_x, objs_y, return_matrix=False)
         match_map = {i: j for (i, j) in matches}
+
         for i, ox in enumerate(objs_x):
             j = match_map.get(i)
+            cin = int(ox.color)
+            if cin not in action_counts_by_color:
+                action_counts_by_color[cin] = np.zeros(A, dtype=np.int64)
+
             if j is None:
+                a = 0  # identity fallback if no match
+                action_counts_by_color[cin][a] += 1
+                action_counts_global[a] += 1
                 continue
+
             oy = objs_y[j]
-            cin, cout = int(ox.color), int(oy.color)
-            cy_in, cx_in = ox.centroid_rc
-            cy_out, cx_out = oy.centroid_rc
-            dy = int(np.round(cy_out - cy_in))
-            dx = int(np.round(cx_out - cx_in))
-            deltas_by_color.setdefault(cin, []).append((dy, dx))
-            all_deltas.append((dy, dx))
+            a = best_action_by_iou(ox.mask, oy.mask)
+            action_counts_by_color[cin][a] += 1
+            action_counts_global[a] += 1
+
+            cout = int(oy.color)
             color_votes.setdefault(cin, {})
             color_votes[cin][cout] = color_votes[cin].get(cout, 0) + 1
 
-    deltas_per_color: Dict[int, Tuple[int, int]] = {}
-    for cin, lst in deltas_by_color.items():
-        dys = np.array([d[0] for d in lst], dtype=int)
-        dxs = np.array([d[1] for d in lst], dtype=int)
-        deltas_per_color[cin] = (int(np.median(dys)), int(np.median(dxs)))
-    global_delta = (
-        int(np.median([d[0] for d in all_deltas])) if all_deltas else 0,
-        int(np.median([d[1] for d in all_deltas])) if all_deltas else 0,
+    # convert to discrete priors (argmax choice at prediction time)
+    action_mode_by_color = {
+        c: int(np.argmax(cnts)) for c, cnts in action_counts_by_color.items()
+    }
+    action_global_mode = (
+        int(np.argmax(action_counts_global)) if action_counts_global.sum() else 0
     )
-    color_map: Dict[int, int] = {
-        cin: max(d.items(), key=lambda kv: kv[1])[0] for cin, d in color_votes.items()
+    color_map = {
+        cin: max(v.items(), key=lambda kv: kv[1])[0] for cin, v in color_votes.items()
     }
     if out_shape is None:
         out_shape = train_pairs[-1][1].shape
-    return deltas_per_color, global_delta, color_map, out_shape
+    return action_mode_by_color, action_global_mode, color_map, out_shape
 
 
 # ---------- robust locations helpers ----------
@@ -603,19 +664,50 @@ class ARCRGMSolver:
 
                 self.agent = _TrivialAgent(self.kmeans.n_clusters)
                 self.o2o = {o: o for o in range(self.kmeans.n_clusters)}
+                # (
+                #     self.deltas_per_color,
+                #     self.global_delta,
+                #     self.color_map,
+                #     self.out_shape,
+                # ) = _learn_motion_and_colors(train_pairs, self.background)
                 (
-                    self.deltas_per_color,
-                    self.global_delta,
+                    self.action_mode_by_color,
+                    self.action_global_mode,
                     self.color_map,
                     self.out_shape,
-                ) = _learn_motion_and_colors(train_pairs, self.background)
+                ) = _learn_actions_and_colors(train_pairs, self.background)
+
                 return
 
         self.agent = agents[0]
         self.o2o = _derive_token_transition_from_agent(self.agent)
-        self.deltas_per_color, self.global_delta, self.color_map, self.out_shape = (
-            _learn_motion_and_colors(train_pairs, self.background)
-        )
+        # self.deltas_per_color, self.global_delta, self.color_map, self.out_shape = (
+        #     _learn_motion_and_colors(train_pairs, self.background)
+        # )
+        (
+            self.action_mode_by_color,
+            self.action_global_mode,
+            self.color_map,
+            self.out_shape,
+        ) = _learn_actions_and_colors(train_pairs, self.background)
+
+    # def predict_grid(self, grid: np.ndarray) -> np.ndarray:
+    #     assert self.kmeans is not None and self.agent is not None
+    #     H_out, W_out = self.out_shape if self.out_shape is not None else grid.shape
+    #     out_bg = infer_background_color(grid)
+    #     canvas = np.full((H_out, W_out), out_bg, dtype=grid.dtype)
+
+    #     objs, toks = _extract_objs_and_tokens(grid, self.background, self.kmeans)
+    #     for i, o in enumerate(objs):
+    #         cin = int(o.color)
+    #         tok_in = int(toks[i])
+    #         tok_out = self.o2o.get(tok_in, tok_in)
+    #         cout = self.color_map.get(
+    #             cin, cin
+    #         )  # recolor (currently ignores tok_out; easy to extend)
+    #         dy, dx = self.deltas_per_color.get(cin, self.global_delta)
+    #         move_mask_into(canvas, o.mask, dy, dx, cout)
+    #     return canvas
 
     def predict_grid(self, grid: np.ndarray) -> np.ndarray:
         assert self.kmeans is not None and self.agent is not None
@@ -626,13 +718,16 @@ class ARCRGMSolver:
         objs, toks = _extract_objs_and_tokens(grid, self.background, self.kmeans)
         for i, o in enumerate(objs):
             cin = int(o.color)
-            tok_in = int(toks[i])
-            tok_out = self.o2o.get(tok_in, tok_in)
-            cout = self.color_map.get(
-                cin, cin
-            )  # recolor (currently ignores tok_out; easy to extend)
-            dy, dx = self.deltas_per_color.get(cin, self.global_delta)
-            move_mask_into(canvas, o.mask, dy, dx, cout)
+            tok_in = int(
+                toks[i]
+            )  # currently not used for action choice, but kept for future
+            # recolor by learned map (fallback keep)
+            cout = self.color_map.get(cin, cin)
+            # choose action by color prior (fallback to global)
+            a = self.action_mode_by_color.get(cin, self.action_global_mode)
+            # apply action to the object's mask
+            transformed = apply_action_mask(o.mask, a, H_out, W_out)
+            canvas[transformed] = cout
         return canvas
 
     def solve_task(self, task: Dict[str, Any]) -> List[np.ndarray]:
