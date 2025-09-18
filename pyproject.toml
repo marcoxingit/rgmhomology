@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rgm"
+version = "0.0.1"
+description = "A Python package for Renormalising Generative Models using PyMDP"
+authors = [
+    { name = "Tim Verbelen", email="tim.verbelen@verses.ai"},
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "inferactively-pymdp@git+https://github.com/infer-actively/pymdp.git@v1.0.0_alpha",
+    "mediapy>=1.2.2",
+    "imageio>=2.34.1",
+    "opencv-python>=4.10.0",
+    "jax>=0.4.34",
+    "jaxlib>=0.4.34"
+]
+
+[project.optional-dependencies]
+dmc = [
+    "gym==0.26.2",
+    "dm_control==1.0.22",
+    "torch==2.4.0",
+    "skrl==1.2.0",
+    "PyYAML>=6.0.0",
+]
+atari = [
+    "atari@git+https://github.com/VersesTech/atari.git@main"
+]
+
+[tool.setuptools]
+packages = [
+    'rgm',
+]
